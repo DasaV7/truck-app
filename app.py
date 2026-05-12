@@ -1,8 +1,7 @@
 # app.py
 """
-A03 Streamlit app: centralized GitHub-backed data file (CSV) + uploads stored in repo.
-- If GITHUB_TOKEN is set, app reads/writes CSV and uploads files to the repo.
-- If not set, app uses local data/ and uploads/ folders.
+A03 Streamlit app: GitHub-backed CSV metadata + uploads stored in repo.
+Fixed: removed werkzeug dependency; uses PBKDF2 password hashing via hashlib.
 """
 
 import os
@@ -11,17 +10,38 @@ import base64
 import uuid
 import datetime
 import logging
-from typing import Optional, List
+import hashlib
+import hmac
+from typing import Optional
 
 import streamlit as st
 import pandas as pd
-from werkzeug.security import generate_password_hash, check_password_hash
 
 # Optional import for GitHub API (PyGithub)
 try:
-    from github import Github, InputGitTreeElement
+    from github import Github
 except Exception:
     Github = None
+
+# -------------------------
+# Secure password hashing (PBKDF2)
+# -------------------------
+# Store password as: salt (hex) + $ + dk (hex)
+def hash_password(password: str, iterations: int = 200_000) -> str:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"{salt.hex()}${dk.hex()}${iterations}"
+
+def verify_password(stored: str, provided: str) -> bool:
+    try:
+        salt_hex, dk_hex, iter_str = stored.split("$")
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(dk_hex)
+        iterations = int(iter_str)
+        test = hashlib.pbkdf2_hmac("sha256", provided.encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(expected, test)
+    except Exception:
+        return False
 
 # -------------------------
 # Config
@@ -41,7 +61,6 @@ LOCAL_DATA_DIR = "data"
 LOCAL_UPLOAD_DIR = "uploads"
 LOCAL_DATA_PATH = os.path.join(LOCAL_DATA_DIR, "receipts.csv")
 
-# Ensure local dirs exist for fallback
 os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
 os.makedirs(LOCAL_UPLOAD_DIR, exist_ok=True)
 
@@ -53,12 +72,10 @@ if USE_GITHUB:
     repo = gh.get_repo(GITHUB_REPO)
 
 def _get_raw_url(path: str) -> str:
-    """Return raw.githubusercontent URL for a file in the repo branch."""
     owner, repo_name = GITHUB_REPO.split("/")
     return f"https://raw.githubusercontent.com/{owner}/{repo_name}/{GITHUB_BRANCH}/{path}"
 
 def github_get_file(path: str) -> Optional[dict]:
-    """Return dict with 'content' (bytes) and 'sha' or None if not found."""
     try:
         contents = repo.get_contents(path, ref=GITHUB_BRANCH)
         content_bytes = base64.b64decode(contents.content)
@@ -68,21 +85,13 @@ def github_get_file(path: str) -> Optional[dict]:
         return None
 
 def github_create_or_update_file(path: str, content_bytes: bytes, message: str, sha: Optional[str] = None):
-    """Create or update a file in the repo. If sha provided, update; else create."""
     try:
         if sha:
             repo.update_file(path, message, content_bytes, sha, branch=GITHUB_BRANCH)
         else:
             repo.create_file(path, message, content_bytes, branch=GITHUB_BRANCH)
-    except Exception as e:
-        logging.exception("github_create_or_update_file failed")
-        raise
-
-def github_delete_file(path: str, sha: str, message: str):
-    try:
-        repo.delete_file(path, message, sha, branch=GITHUB_BRANCH)
     except Exception:
-        logging.exception("github_delete_file failed")
+        logging.exception("github_create_or_update_file failed")
         raise
 
 # -------------------------
@@ -91,13 +100,11 @@ def github_delete_file(path: str, sha: str, message: str):
 CSV_COLUMNS = ["id","filename","url","uploaded_at","driver","truck","trailer","notes","lat","lon"]
 
 def read_metadata_df() -> pd.DataFrame:
-    """Read metadata CSV from GitHub or local fallback."""
     if USE_GITHUB:
         f = github_get_file(DATA_PATH)
         if f:
             return pd.read_csv(io.BytesIO(f["content"]), dtype=str).fillna("")
         else:
-            # create empty df and commit initial file
             df = pd.DataFrame(columns=CSV_COLUMNS)
             commit_csv_to_github(df, "Create initial receipts CSV")
             return df
@@ -110,7 +117,6 @@ def read_metadata_df() -> pd.DataFrame:
             return df
 
 def commit_csv_to_github(df: pd.DataFrame, message: str):
-    """Commit CSV to GitHub (create or update)."""
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     existing = github_get_file(DATA_PATH)
     if existing:
@@ -120,7 +126,6 @@ def commit_csv_to_github(df: pd.DataFrame, message: str):
         github_create_or_update_file(DATA_PATH, csv_bytes, message, sha=None)
 
 def write_metadata_df(df: pd.DataFrame, message: str = "Update receipts CSV"):
-    """Write metadata to GitHub or local file."""
     if USE_GITHUB:
         commit_csv_to_github(df, message)
     else:
@@ -130,18 +135,13 @@ def write_metadata_df(df: pd.DataFrame, message: str = "Update receipts CSV"):
 # File upload helpers
 # -------------------------
 def save_upload(file_bytes: bytes, filename: str) -> str:
-    """
-    Save uploaded file to GitHub uploads/ directory (or local uploads/).
-    Returns a URL (raw.githubusercontent or local path).
-    """
     unique_name = f"{uuid.uuid4().hex}_{filename}"
     path = f"{UPLOAD_DIR}/{unique_name}"
     if USE_GITHUB:
-        # commit file to repo
         try:
             github_create_or_update_file(path, file_bytes, f"Add upload {unique_name}", sha=None)
             return _get_raw_url(path)
-        except Exception as e:
+        except Exception:
             logging.exception("Failed to upload to GitHub")
             raise
     else:
@@ -151,20 +151,19 @@ def save_upload(file_bytes: bytes, filename: str) -> str:
         return local_path
 
 # -------------------------
-# Simple local auth (for demo)
+# Simple local auth (PBKDF2)
 # -------------------------
-# For GitHub mode you can manage users via the repo or use the app's local user table.
-# This demo uses a simple local user store saved in the CSV metadata (driver field).
-# For production, replace with proper auth (OIDC, Supabase, etc.)
-
 def ensure_master_exists():
-    """Create a default master user in local file if none exists (only for local mode)."""
     if USE_GITHUB:
         return
-    # store users in a small local file
     users_path = os.path.join(LOCAL_DATA_DIR, "users.csv")
     if not os.path.exists(users_path):
-        df = pd.DataFrame([{"username":"master","password_hash":generate_password_hash("masterpass"),"role":"master","display_name":"Owner"}])
+        df = pd.DataFrame([{
+            "username":"master",
+            "password_hash": hash_password("masterpass"),
+            "role":"master",
+            "display_name":"Owner"
+        }])
         df.to_csv(users_path, index=False)
 
 def local_get_user(username: str):
@@ -175,8 +174,7 @@ def local_get_user(username: str):
     row = df[df["username"] == username]
     if row.empty:
         return None
-    r = row.iloc[0].to_dict()
-    return r
+    return row.iloc[0].to_dict()
 
 def local_create_user(username: str, password: str, role: str = "driver", display_name: str = None):
     users_path = os.path.join(LOCAL_DATA_DIR, "users.csv")
@@ -188,7 +186,7 @@ def local_create_user(username: str, password: str, role: str = "driver", displa
         return None
     df = df.append({
         "username": username,
-        "password_hash": generate_password_hash(password),
+        "password_hash": hash_password(password),
         "role": role,
         "display_name": display_name or ""
     }, ignore_index=True)
@@ -199,7 +197,7 @@ def local_verify_login(username: str, password: str):
     u = local_get_user(username)
     if not u:
         return False
-    return check_password_hash(u["password_hash"], password)
+    return verify_password(u["password_hash"], password)
 
 # -------------------------
 # UI and pages
@@ -207,13 +205,13 @@ def local_verify_login(username: str, password: str):
 if "user" not in st.session_state:
     st.session_state.user = None
 
-st.title("Trucking Hub A03 — GitHub-backed DB")
+st.title("Trucking Hub A03 — GitHub-backed DB (fixed)")
 
 if not USE_GITHUB:
     st.warning("Running in local fallback mode. To enable GitHub-backed storage set GITHUB_TOKEN and GITHUB_REPO in app secrets.")
     ensure_master_exists()
 
-# Simple auth UI
+# Auth UI
 if not st.session_state.user:
     st.sidebar.header("Sign in")
     mode = st.sidebar.selectbox("Mode", ["Sign in", "Sign up"])
@@ -226,7 +224,7 @@ if not st.session_state.user:
             submitted = st.form_submit_button("Create account")
             if submitted:
                 if USE_GITHUB:
-                    st.error("Sign up via GitHub mode is not implemented in this demo. Create users via your repo or use local mode.")
+                    st.error("Sign up via GitHub mode is not implemented in this demo. Use local mode or manage users in your repo.")
                 else:
                     ok = local_create_user(username.strip(), password.strip(), role=role, display_name=display.strip())
                     if ok:
@@ -240,7 +238,6 @@ if not st.session_state.user:
             submitted = st.form_submit_button("Sign in")
             if submitted:
                 if USE_GITHUB:
-                    # In GitHub mode we do not implement GitHub Auth; treat any username as driver for demo
                     st.session_state.user = {"username": username.strip(), "role": "driver", "display_name": username.strip()}
                     st.experimental_rerun()
                 else:
@@ -250,9 +247,7 @@ if not st.session_state.user:
                         st.experimental_rerun()
                     else:
                         st.error("Invalid credentials")
-
 else:
-    # Topbar
     cols = st.columns([1, 4, 1])
     with cols[0]:
         st.image("https://upload.wikimedia.org/wikipedia/commons/3/3a/Apple_logo_black.svg", width=36)
@@ -361,8 +356,6 @@ else:
                         st.success("User created")
                     else:
                         st.error("User exists")
-            # list users
             users_path = os.path.join(LOCAL_DATA_DIR, "users.csv")
             if os.path.exists(users_path):
                 st.dataframe(pd.read_csv(users_path).fillna(""))
-
