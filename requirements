@@ -1,5 +1,4 @@
 streamlit>=1.20
-SQLAlchemy>=1.4,<2.0
 pandas>=1.5
 werkzeug>=2.1
-supabase>=1.0.0
+PyGithub>=1.55
